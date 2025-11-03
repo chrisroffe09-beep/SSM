@@ -4,6 +4,7 @@
 # Make launcher executable
 chmod +x ssm
 
+sudo cp ssm_pkg/main.py /usr/local/bin/ssm_pkg/main.py
 # Copy launcher to /usr/local/bin
 echo "Installing SSM globally..."
 if sudo cp ssm /usr/local/bin/ssm; then
