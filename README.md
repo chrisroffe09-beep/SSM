@@ -18,12 +18,15 @@ A beginner-friendly terminal-based system monitor for Ubuntu/Linux.
 ## Installation
 
 1. **Clone the repository:**
-git clone https://github.com/SourMitten/SSM.git
-
+```
+git clone "https://github.com/SourMitten/SSM.git"
+```
 2. **Install Python dependencies:**
+```
 pip install -r /SSM/requirements.txt
-
-3. **Install SSM globally** (requires sudo):
+```
+(Note: if you used LNFinal Setup from UBAutoSetup {https://github.com/SourMitten/UBAutoSetup}, you can skip this step)
+4. **Install SSM globally** (requires sudo):
 bash /SSM/install.sh
 This will copy the launcher to /usr/local/bin, so you can run `ssm` from anywhere.
 
