@@ -5,16 +5,19 @@ import socket
 from datetime import timedelta
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, BarColumn, TextColumn, ProgressColumn
+from rich.progress import Progress, BarColumn, TextColumn
 from rich.live import Live
 from rich.panel import Panel
 from rich.layout import Layout
 from rich.text import Text
 from rich.style import Style
+import keyboard  # pip install keyboard
 
 console = Console()
 prev_net = None  # previous net counters
+kill_requested = False
 
+# ---------------- Helper Functions ----------------
 def get_color(value: float) -> str:
     if value < 50:
         return "green"
@@ -75,30 +78,55 @@ def get_top_processes(limit=10):
     procs = sorted(procs, key=lambda p: p['cpu_percent'], reverse=True)
     return procs[:limit]
 
+# ---------------- Layout Builders ----------------
 def create_layout():
     layout = Layout()
     layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="bars", size=9),
+        Layout(name="header", size=4),
+        Layout(name="bars", size=6),
         Layout(name="network", size=3),
-        Layout(name="processes")
+        Layout(name="bottom")  # combine processes + disk preview
+    )
+
+    layout["bottom"].split_row(
+        Layout(name="processes"),
+        Layout(name="disk_preview", size=30)
     )
     return layout
 
-def render_layout(layout, stats, top_procs, progress):
-    # Header
-    header_text = Text(f"Sour CLI Sys Monitor — {stats['hostname']} | Uptime: {stats['uptime']}", style="bold green")
-    commands_text = Text("Commands: Ctrl+C = Exit", style="bold cyan")
-    layout["header"].update(Panel(header_text + "\n" + commands_text, style="bold white"))
+def build_bars(stats):
+    cpu_color = get_color(stats["cpu"])
+    mem_color = get_color(stats["mem_used"])
+    disk_color = get_color(stats["disk_used"])
 
-    # Update bars
-    progress["cpu"].update(stats["cpu"])
-    progress["mem"].update(stats["mem_used"])
-    progress["disk"].update(stats["disk_used"])
-    layout["bars"].update(progress.renderable())
+    cpu_bar = Progress(
+        "[bold blue]CPU   ",
+        BarColumn(bar_width=None, complete_style=Style(color=cpu_color)),
+        TextColumn("{task.percentage:>3.0f}%")
+    )
+    mem_bar = Progress(
+        "[bold magenta]Memory",
+        BarColumn(bar_width=None, complete_style=Style(color=mem_color)),
+        TextColumn("{task.percentage:>3.0f}%")
+    )
+    disk_bar = Progress(
+        "[bold yellow]Disk  ",
+        BarColumn(bar_width=None, complete_style=Style(color=disk_color)),
+        TextColumn("{task.percentage:>3.0f}%")
+    )
 
-    # Network Table
-    net_table = Table.grid()
+    cpu_bar.add_task("CPU", total=100, completed=stats["cpu"])
+    mem_bar.add_task("Memory", total=100, completed=stats["mem_used"])
+    disk_bar.add_task("Disk", total=100, completed=stats["disk_used"])
+
+    bars_table = Table.grid(expand=True)
+    bars_table.add_row(cpu_bar)
+    bars_table.add_row(mem_bar)
+    bars_table.add_row(disk_bar)
+    return bars_table
+
+def build_network_table(stats):
+    net_table = Table.grid(expand=True)
     net_table.add_column(justify="right")
     net_table.add_column(justify="right")
     net_table.add_row("Upload", "Download")
@@ -106,58 +134,97 @@ def render_layout(layout, stats, top_procs, progress):
         format_bytes_per_sec(stats["net_sent_rate"]),
         format_bytes_per_sec(stats["net_recv_rate"])
     )
-    layout["network"].update(Panel(net_table, title="Network Info", style="bold green"))
+    return Panel(net_table, title="Network Info", style="bold green")
 
-    # Processes Table
-    proc_table = Table(show_header=True, header_style="bold cyan")
+def build_process_table(top_procs):
+    proc_table = Table(expand=True, show_header=True, header_style="bold cyan")
+    proc_table.add_column("No.", justify="right")
     proc_table.add_column("PID", justify="right")
     proc_table.add_column("Name")
     proc_table.add_column("CPU %", justify="right")
     proc_table.add_column("Memory %", justify="right")
-    for p in top_procs:
+    for i, p in enumerate(top_procs, 1):
         proc_table.add_row(
+            str(i),
             str(p["pid"]),
             p["name"][:20] if p["name"] else "N/A",
             f"{p['cpu_percent']:.1f}",
             f"{p['memory_percent']:.1f}"
         )
-    layout["processes"].update(proc_table)
+    return proc_table
 
+def build_disk_preview():
+    disks = psutil.disk_partitions(all=False)
+    table = Table(expand=True, show_header=True, header_style="bold magenta")
+    table.add_column("Device")
+    table.add_column("Mountpoint")
+    table.add_column("FS Type")
+    table.add_column("Used %", justify="right")
+
+    for d in disks:
+        try:
+            usage = psutil.disk_usage(d.mountpoint)
+            table.add_row(
+                d.device,
+                d.mountpoint,
+                d.fstype,
+                f"{usage.percent:.0f}%"
+            )
+        except PermissionError:
+            continue
+    return Panel(table, title="Disk Preview", style="bold yellow")
+
+# ---------------- Render ----------------
+def render_layout(layout, stats, top_procs):
+    header_text = Text(f"Sour CLI Sys Monitor — {stats['hostname']} | Uptime: {stats['uptime']}", style="bold green")
+    commands_text = Text("Commands: Ctrl+C = Exit | Press 'k' to kill a process", style="bold cyan")
+    layout["header"].update(Panel(header_text + "\n" + commands_text, style="bold white"))
+
+    layout["bars"].update(build_bars(stats))
+    layout["network"].update(build_network_table(stats))
+    layout["processes"].update(build_process_table(top_procs))
+    layout["disk_preview"].update(build_disk_preview())
+
+# ---------------- Kill Process ----------------
+def kill_process_prompt(top_procs):
+    global kill_requested
+    kill_requested = True
+    console.print("\n[bold yellow]Kill a process[/bold yellow]")
+    for i, p in enumerate(top_procs, 1):
+        console.print(f"[cyan]{i}[/cyan]: {p['name']} (PID {p['pid']}) CPU {p['cpu_percent']:.1f}%")
+    try:
+        choice = int(console.input("Enter process number to kill (0 to cancel): "))
+        if choice == 0:
+            return
+        proc_info = top_procs[choice - 1]
+        proc = psutil.Process(proc_info['pid'])
+        proc.terminate()
+        console.print(f"[green]Sent terminate signal to {proc_info['name']} (PID {proc.pid})[/green]")
+    except (ValueError, IndexError):
+        console.print("[red]Invalid selection[/red]")
+    except psutil.AccessDenied:
+        console.print("[red]Permission denied[/red]")
+    finally:
+        kill_requested = False
+
+# ---------------- Main ----------------
 def main():
     global prev_net
     prev_net = psutil.net_io_counters()
-    time.sleep(1)  # prime network counters
-
-    # Initialize progress bars
-    progress = {
-        "cpu": Progress(
-            "[bold blue]CPU   ",
-            BarColumn(bar_width=None, complete_style=Style(color="green")),
-            TextColumn("{task.percentage:>3.0f}%"),
-            transient=False
-        ).add_task("CPU", total=100, completed=0),
-        "mem": Progress(
-            "[bold magenta]Memory",
-            BarColumn(bar_width=None, complete_style=Style(color="green")),
-            TextColumn("{task.percentage:>3.0f}%"),
-            transient=False
-        ).add_task("Memory", total=100, completed=0),
-        "disk": Progress(
-            "[bold yellow]Disk  ",
-            BarColumn(bar_width=None, complete_style=Style(color="green")),
-            TextColumn("{task.percentage:>3.0f}%"),
-            transient=False
-        ).add_task("Disk", total=100, completed=0)
-    }
+    time.sleep(1)
 
     layout = create_layout()
+
+    # Keyboard listener for 'k'
+    keyboard.add_hotkey('k', lambda: kill_process_prompt(get_top_processes()))
 
     with Live(layout, refresh_per_second=1, screen=True):
         try:
             while True:
-                stats = get_system_stats()
-                top_procs = get_top_processes()
-                render_layout(layout, stats, top_procs, progress)
+                if not kill_requested:  # don't update Live while in kill prompt
+                    stats = get_system_stats()
+                    top_procs = get_top_processes()
+                    render_layout(layout, stats, top_procs)
                 time.sleep(1)
         except KeyboardInterrupt:
             console.print("\n[red]Exiting Sour CLI Sys Monitor...[/red]")
