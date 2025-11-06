@@ -15,7 +15,6 @@ import keyboard  # pip install keyboard
 
 console = Console()
 prev_net = None
-kill_prompt_active = False  # Pause Live updates while prompting
 
 # ---------------- Helper Functions ----------------
 def get_color(value: float) -> str:
@@ -88,9 +87,10 @@ def create_layout():
         Layout(name="bottom")
     )
 
+    # Use ratios instead of fixed size for bottom row
     layout["bottom"].split_row(
-        Layout(name="processes"),
-        Layout(name="disk_preview", size=30)
+        Layout(name="processes", ratio=3),
+        Layout(name="disk_preview", ratio=1)
     )
     return layout
 
@@ -156,9 +156,9 @@ def build_process_table(top_procs):
 def build_disk_preview():
     disks = psutil.disk_partitions(all=False)
     table = Table(expand=True, show_header=True, header_style="bold magenta")
-    table.add_column("Device")
-    table.add_column("Mountpoint")
-    table.add_column("FS Type")
+    table.add_column("Dev")
+    table.add_column("Mount")
+    table.add_column("FS")
     table.add_column("Used %", justify="right")
 
     for d in disks:
@@ -185,17 +185,21 @@ def render_layout(layout, stats, top_procs):
     layout["disk_preview"].update(build_disk_preview())
 
 # ---------------- Kill Process ----------------
-def kill_process_prompt(top_procs):
-    global kill_prompt_active
-    kill_prompt_active = True
-
+def kill_process_prompt(top_procs, live):
+    """
+    Stops live rendering temporarily to allow user input.
+    """
+    live.stop()
     console.print("\n[bold yellow]Kill a process[/bold yellow]")
+
     for i, p in enumerate(top_procs, 1):
-        console.print(f"[cyan]{i}[/cyan]: {p['name']} (PID {p['pid']}) CPU {p['cpu_percent']:.1f}%")
+        name = p["name"][:30] if p["name"] else "N/A"
+        console.print(f"[cyan]{i}[/cyan]: {name} (PID {p['pid']}) CPU {p['cpu_percent']:.1f}%")
 
     try:
         choice = int(console.input("Enter process number to kill (0 to cancel): "))
         if choice == 0:
+            console.print("[green]Cancelled[/green]")
             return
         proc_info = top_procs[choice - 1]
         proc = psutil.Process(proc_info['pid'])
@@ -206,7 +210,7 @@ def kill_process_prompt(top_procs):
     except psutil.AccessDenied:
         console.print("[red]Permission denied[/red]")
     finally:
-        kill_prompt_active = False
+        live.start()
 
 # ---------------- Main ----------------
 def main():
@@ -216,16 +220,15 @@ def main():
 
     layout = create_layout()
 
-    # Keyboard listener for 'k'
-    keyboard.add_hotkey('k', lambda: kill_process_prompt(get_top_processes()))
+    with Live(layout, refresh_per_second=1, screen=True) as live:
+        # Keyboard listener for 'k' key
+        keyboard.add_hotkey('k', lambda: kill_process_prompt(get_top_processes(), live))
 
-    with Live(layout, refresh_per_second=1, screen=True):
         try:
             while True:
-                if not kill_prompt_active:
-                    stats = get_system_stats()
-                    top_procs = get_top_processes()
-                    render_layout(layout, stats, top_procs)
+                stats = get_system_stats()
+                top_procs = get_top_processes()
+                render_layout(layout, stats, top_procs)
                 time.sleep(1)
         except KeyboardInterrupt:
             console.print("\n[red]Exiting Sour CLI Sys Monitor...[/red]")
