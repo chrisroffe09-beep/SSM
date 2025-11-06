@@ -277,7 +277,7 @@ def main():
                     kill_requested = False
                     kill_process_prompt(top_procs, live)
 
-                time.sleep(0.5)
+                time.sleep(0.2)
 
         except KeyboardInterrupt:
             console.print("\n[red]Exiting Sour CLI Sys Monitor...[/red]")
