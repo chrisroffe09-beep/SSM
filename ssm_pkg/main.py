@@ -16,6 +16,7 @@ import keyboard  # pip install keyboard
 console = Console()
 prev_net = None
 prev_time = None
+kill_prompt_active = False
 
 # ---------------- Helper Functions ----------------
 def get_color(value: float) -> str:
@@ -51,13 +52,13 @@ def get_system_stats():
     hostname = socket.gethostname()
 
     current_time = time.time()
-    interval = current_time - prev_time if prev_time else 1
+    interval = current_time - prev_time if prev_time else 1.0
     if prev_net:
-        sent_rate = (net.bytes_sent - prev_net.bytes_sent) / interval
-        recv_rate = (net.bytes_recv - prev_net.bytes_recv) / interval
+        sent_rate = float(net.bytes_sent - prev_net.bytes_sent) / interval
+        recv_rate = float(net.bytes_recv - prev_net.bytes_recv) / interval
     else:
-        sent_rate = 0
-        recv_rate = 0
+        sent_rate = 0.0
+        recv_rate = 0.0
 
     prev_net = net
     prev_time = current_time
@@ -92,7 +93,6 @@ def create_layout():
         Layout(name="bottom")
     )
 
-    # 60/40 split for bottom row
     layout["bottom"].split_row(
         Layout(name="processes", ratio=3),
         Layout(name="disk_preview", ratio=2)
@@ -188,10 +188,25 @@ def render_layout(layout, stats, top_procs):
     layout["disk_preview"].update(build_disk_preview())
 
 # ---------------- Kill Process ----------------
+def kill_proc(pid):
+    try:
+        proc = psutil.Process(pid)
+        proc.terminate()  # polite termination
+        try:
+            proc.wait(timeout=3)
+            console.print(f"[green]Process {pid} terminated gracefully[/green]")
+        except psutil.TimeoutExpired:
+            proc.kill()  # force kill if still alive
+            proc.wait()
+            console.print(f"[red]Process {pid} killed forcefully[/red]")
+    except psutil.NoSuchProcess:
+        console.print(f"[yellow]Process {pid} does not exist[/yellow]")
+    except psutil.AccessDenied:
+        console.print(f"[red]Access denied to kill process {pid}[/red]")
+
 def kill_process_prompt(top_procs, live):
-    """
-    Stops live rendering temporarily to allow user input.
-    """
+    global kill_prompt_active
+    kill_prompt_active = True
     live.stop()
     console.print("\n[bold yellow]Kill a process[/bold yellow]")
 
@@ -203,16 +218,13 @@ def kill_process_prompt(top_procs, live):
         choice = int(console.input("Enter process number to kill (0 to cancel): "))
         if choice == 0:
             console.print("[green]Cancelled[/green]")
-            return
-        proc_info = top_procs[choice - 1]
-        proc = psutil.Process(proc_info['pid'])
-        proc.terminate()
-        console.print(f"[green]Sent terminate signal to {proc_info['name']} (PID {proc.pid})[/green]")
+        else:
+            proc_info = top_procs[choice - 1]
+            kill_proc(proc_info['pid'])
     except (ValueError, IndexError):
         console.print("[red]Invalid selection[/red]")
-    except psutil.AccessDenied:
-        console.print("[red]Permission denied[/red]")
     finally:
+        kill_prompt_active = False
         live.start()
 
 # ---------------- Main ----------------
@@ -225,14 +237,13 @@ def main():
     layout = create_layout()
 
     with Live(layout, refresh_per_second=1, screen=True) as live:
-        # Keyboard listener for 'k' key
         keyboard.add_hotkey('k', lambda: kill_process_prompt(get_top_processes(), live))
-
         try:
             while True:
-                stats = get_system_stats()
-                top_procs = get_top_processes()
-                render_layout(layout, stats, top_procs)
+                if not kill_prompt_active:
+                    stats = get_system_stats()
+                    top_procs = get_top_processes()
+                    render_layout(layout, stats, top_procs)
                 time.sleep(1)
         except KeyboardInterrupt:
             console.print("\n[red]Exiting Sour CLI Sys Monitor...[/red]")
