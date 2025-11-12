@@ -6,7 +6,7 @@ import threading
 from datetime import timedelta
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, BarColumn, TextColumn
+from rich.progress import Progress, BarColumn, TextColumn, SpinnerColumn
 from rich.live import Live
 from rich.panel import Panel
 from rich.layout import Layout
@@ -17,23 +17,25 @@ import speedtest
 
 console = Console()
 kill_requested = False
+network_visible = True
+freeze = False
+speedtest_active = False
 speedtest_running = False
 speedtest_final = None
-freeze_requested = False
 
 # ---------------- Key Listener ----------------
 def listen_for_keys():
-    global kill_requested, speedtest_running, freeze_requested
+    global kill_requested, network_visible, freeze, speedtest_active
     while True:
-        event = keyboard.read_event()
-        if event.event_type == keyboard.KEY_DOWN:
-            if event.name == "k":
+        key = keyboard.read_event()
+        if key.event_type == "down":
+            if key.name == "k":
                 kill_requested = True
-            elif event.name == "n":
-                if not speedtest_running:
-                    speedtest_running = True
-            elif event.name == "f":
-                freeze_requested = not freeze_requested
+            elif key.name == "n":
+                network_visible = True
+                speedtest_active = True
+            elif key.name == "f":
+                freeze = not freeze
 
 # ---------------- Helper Functions ----------------
 def get_color(value: float) -> str:
@@ -44,21 +46,8 @@ def get_color(value: float) -> str:
     else:
         return "red"
 
-def format_bytes_per_sec(bps: float) -> str:
-    kb = bps / 1024
-    mb = kb / 1024
-    gb = mb / 1024
-    if gb >= 1:
-        return f"{gb:.2f} GB/s"
-    elif mb >= 1:
-        return f"{mb:.2f} MB/s"
-    elif kb >= 1:
-        return f"{kb:.2f} KB/s"
-    else:
-        return f"{bps:.0f} B/s"
-
 def format_speed(bps: float) -> str:
-    mbps = bps / 1024 / 1024
+    mbps = bps / 1_000_000
     return f"{mbps:.2f} Mbps"
 
 def get_system_stats():
@@ -93,12 +82,15 @@ def create_layout():
     layout.split_column(
         Layout(name="header", size=4),
         Layout(name="bars", size=6),
-        Layout(name="network", size=6),
         Layout(name="bottom")
     )
     layout["bottom"].split_row(
-        Layout(name="processes", ratio=60),
+        Layout(name="left", ratio=60),
         Layout(name="disk_preview", ratio=40)
+    )
+    layout["left"].split_column(
+        Layout(name="processes", ratio=60),
+        Layout(name="network", ratio=40)
     )
     return layout
 
@@ -122,66 +114,14 @@ def build_bars(stats):
         BarColumn(bar_width=None, complete_style=Style(color=disk_color)),
         TextColumn("{task.percentage:>3.0f}%")
     )
-
     cpu_bar.add_task("CPU", total=100, completed=stats["cpu"])
     mem_bar.add_task("Memory", total=100, completed=stats["mem_used"])
     disk_bar.add_task("Disk", total=100, completed=stats["disk_used"])
-
     bars_table = Table.grid(expand=True)
     bars_table.add_row(cpu_bar)
     bars_table.add_row(mem_bar)
     bars_table.add_row(disk_bar)
     return bars_table
-
-# ---------------- Speedtest Panel ----------------
-def build_speedtest_panel():
-    global speedtest_running, speedtest_final
-    panel = Panel(Text("Press 'n' to start Speedtest", justify="center"), title="Network Speed", style="bold green")
-    if speedtest_running:
-        try:
-            st = speedtest.Speedtest()
-            st.get_best_server()
-
-            download_bar = Progress(
-                "[bold green]Download ",
-                BarColumn(bar_width=None, complete_style=Style(color="green")),
-                TextColumn("{task.percentage:>3.0f}% {task.fields[speed]}")
-            )
-            upload_bar = Progress(
-                "[bold cyan]Upload   ",
-                BarColumn(bar_width=None, complete_style=Style(color="cyan")),
-                TextColumn("{task.percentage:>3.0f}% {task.fields[speed]}")
-            )
-
-            d_task = download_bar.add_task("download", total=100, speed="0 Mbps")
-            u_task = upload_bar.add_task("upload", total=100, speed="0 Mbps")
-
-            table = Table.grid(expand=True)
-            table.add_row(download_bar)
-            table.add_row(upload_bar)
-            panel = Panel(table, title="Running Speedtest...", style="bold green")
-
-            # Animate bars simultaneously
-            for i in range(20):
-                download_bar.update(d_task, completed=min((i+1)*5,100), speed=format_speed(st.download()/20))
-                upload_bar.update(u_task, completed=min((i+1)*5,100), speed=format_speed(st.upload()/20))
-                time.sleep(0.2)
-
-            download_bps = st.results.download
-            upload_bps = st.results.upload
-            speedtest_final = (download_bps, upload_bps)
-            panel = Panel(Text(f"Final Outputs:\nUp.: {format_speed(upload_bps)}\nDown.: {format_speed(download_bps)}", justify="center"),
-                          title="Speedtest Complete", style="bold green")
-
-        except Exception as e:
-            panel = Panel(Text(f"Speedtest failed: {e}", justify="center"), style="bold red")
-        finally:
-            speedtest_running = False
-
-    elif speedtest_final:
-        panel = Panel(Text(f"Final Outputs:\nUp.: {format_speed(speedtest_final[1])}\nDown.: {format_speed(speedtest_final[0])}", justify="center"),
-                      title="Speedtest Results", style="bold green")
-    return panel
 
 def build_process_table(top_procs):
     proc_table = Table(expand=True, show_header=True, header_style="bold cyan")
@@ -215,14 +155,98 @@ def build_disk_preview():
             continue
     return Panel(table, title="Disk Preview", style="bold yellow")
 
+# ---------------- Speedtest ----------------
+def run_speedtest(panel):
+    global speedtest_running, speedtest_final
+    speedtest_running = True
+    try:
+        st = speedtest.Speedtest()
+        st.get_best_server()
+        download_bps = upload_bps = 0
+
+        download_task = st.download
+        upload_task = st.upload
+
+        # Animate both download and upload
+        download_bar = Progress(
+            "[bold green]Download ",
+            BarColumn(bar_width=None, complete_style=Style(color="green")),
+            TextColumn("{task.percentage:>3.0f}% {task.fields[speed]}"),
+        )
+        upload_bar = Progress(
+            "[bold cyan]Upload   ",
+            BarColumn(bar_width=None, complete_style=Style(color="cyan")),
+            TextColumn("{task.percentage:>3.0f}% {task.fields[speed]}"),
+        )
+        download_id = download_bar.add_task("download", total=100, speed="0 Mbps")
+        upload_id = upload_bar.add_task("upload", total=100, speed="0 Mbps")
+
+        panel.update(Panel(download_bar, title="Speedtest Download", style="bold green"))
+
+        # Run download
+        for i in range(20):
+            partial = download_task()
+            percent = min((i+1)*5, 100)
+            download_bar.update(download_id, completed=percent, speed=format_speed(partial))
+            panel.update(Panel(download_bar, title="Speedtest Download", style="bold green"))
+            time.sleep(0.2)
+
+        # Run upload
+        for i in range(20):
+            partial = upload_task()
+            percent = min((i+1)*5, 100)
+            upload_bar.update(upload_id, completed=percent, speed=format_speed(partial))
+            panel.update(Panel(upload_bar, title="Speedtest Upload", style="bold cyan"))
+            time.sleep(0.2)
+
+        # Final results
+        download_bps = st.results.download
+        upload_bps = st.results.upload
+        speedtest_final = (download_bps, upload_bps)
+        panel.update(
+            Panel(
+                Text(f"Final Outputs:\nUp.: {format_speed(upload_bps)}\nDown.: {format_speed(download_bps)}", justify="center"),
+                title="Speedtest Complete", style="bold green"
+            )
+        )
+
+    except Exception as e:
+        panel.update(Panel(Text(f"Speedtest failed: {e}", justify="center"), style="bold red"))
+    finally:
+        speedtest_running = False
+
+# ---------------- Render ----------------
 def render_layout(layout, stats, top_procs):
-    header_text = Text(f"Sour CLI Sys Monitor — {stats['hostname']} | Uptime: {stats['uptime']}", style="bold green")
-    commands_text = Text("Commands: Ctrl+C = Exit | k = Kill | n = Speedtest | f = Freeze", style="bold cyan")
+    header_text = Text(
+        f"Sour CLI Sys Monitor — {stats['hostname']} | Uptime: {stats['uptime']}",
+        style="bold green"
+    )
+    commands_text = Text(
+        "Commands: Ctrl+C = Exit | k = Kill | n = Speedtest | f = Freeze",
+        style="bold cyan"
+    )
     layout["header"].update(Panel(header_text + "\n" + commands_text, style="bold white"))
     layout["bars"].update(build_bars(stats))
-    layout["network"].update(build_speedtest_panel())
     layout["processes"].update(build_process_table(top_procs))
     layout["disk_preview"].update(build_disk_preview())
+
+    if network_visible:
+        if speedtest_running:
+            pass  # The thread updates the panel directly
+        elif speedtest_final:
+            download_bps, upload_bps = speedtest_final
+            layout["network"].update(
+                Panel(
+                    Text(f"Final Outputs:\nUp.: {format_speed(upload_bps)}\nDown.: {format_speed(download_bps)}", justify="center"),
+                    title="Speedtest Complete", style="bold green"
+                )
+            )
+        else:
+            layout["network"].update(
+                Panel(Text("Press 'n' to run Speedtest", justify="center"), style="bold green")
+            )
+    else:
+        layout["network"].update(Panel(Text("Network panel hidden", justify="center"), style="bold green"))
 
 # ---------------- Kill Process ----------------
 def kill_proc_tree(pid):
@@ -237,13 +261,13 @@ def kill_proc_tree(pid):
         console.print(f"[red]Error killing process: {e}[/red]")
 
 def kill_process_prompt(top_procs, live):
-    global kill_requested
     live.stop()
     console.clear()
     console.print("[bold yellow]Kill a process[/bold yellow]")
     for i, p in enumerate(top_procs, 1):
         console.print(f"[cyan]{i}[/cyan]: {p['name']} (PID {p['pid']}) CPU {p['cpu_percent']:.1f}%")
     try:
+        console.print()
         choice = int(console.input("[bold white]Enter process number to kill (0 to cancel): [/bold white]"))
         if choice == 0:
             console.print("[yellow]Canceled.[/yellow]")
@@ -259,22 +283,34 @@ def kill_process_prompt(top_procs, live):
 
 # ---------------- Main ----------------
 def main():
-    global kill_requested
+    global kill_requested, speedtest_active
+
     threading.Thread(target=listen_for_keys, daemon=True).start()
     layout = create_layout()
-    with Live(layout, refresh_per_second=2, screen=True) as live:
+
+    with Live(layout, refresh_per_second=4, screen=True) as live:
         try:
             while True:
-                if freeze_requested:
-                    time.sleep(0.2)
-                    continue
                 stats = get_system_stats()
                 top_procs = get_top_processes()
+
+                if freeze:
+                    time.sleep(0.2)
+                    continue
+
                 render_layout(layout, stats, top_procs)
+
                 if kill_requested:
                     kill_requested = False
                     kill_process_prompt(top_procs, live)
+
+                # Trigger Speedtest
+                if network_visible and speedtest_active and not speedtest_running:
+                    speedtest_active = False
+                    threading.Thread(target=run_speedtest, args=(layout["network"],), daemon=True).start()
+
                 time.sleep(0.2)
+
         except KeyboardInterrupt:
             console.print("\n[red]Exiting Sour CLI Sys Monitor...[/red]")
 
