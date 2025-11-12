@@ -3,7 +3,6 @@ import psutil
 import time
 import socket
 import threading
-import subprocess
 from datetime import timedelta
 from rich.console import Console
 from rich.table import Table
@@ -16,39 +15,27 @@ from rich.style import Style
 import keyboard
 
 console = Console()
-
-# ---------------- Global State ----------------
 prev_net = None
 prev_time = None
 kill_requested = False
-freeze_requested = False
-speedtest_toggle = False
+network_visible = True
+freeze = False
 speedtest_running = False
-speedtest_result_text = ""
-speedtest_error = None
-speed_samples = []
-speed_samples_lock = threading.Lock()
 
-# ---------------- Key Listeners ----------------
-def listen_for_kill():
-    global kill_requested
-    while True:
-        keyboard.wait("k")
-        kill_requested = True
 
-def listen_for_freeze():
-    global freeze_requested
+# ---------------- Key Listener ----------------
+def listen_for_keys():
+    global kill_requested, network_visible, freeze
     while True:
-        keyboard.wait("f")
-        freeze_requested = not freeze_requested
+        key = keyboard.read_event()
+        if key.event_type == "down":
+            if key.name == "k":
+                kill_requested = True
+            elif key.name == "n":
+                network_visible = not network_visible
+            elif key.name == "f":
+                freeze = not freeze
 
-def listen_for_speedtest_toggle():
-    global speedtest_toggle
-    while True:
-        keyboard.wait("n")
-        speedtest_toggle = not speedtest_toggle
-        if speedtest_toggle:
-            run_speedtest_background()
 
 # ---------------- Helper Functions ----------------
 def get_color(value: float) -> str:
@@ -58,6 +45,7 @@ def get_color(value: float) -> str:
         return "yellow"
     else:
         return "red"
+
 
 def format_bytes_per_sec(bps: float) -> str:
     kb = bps / 1024
@@ -72,8 +60,10 @@ def format_bytes_per_sec(bps: float) -> str:
     else:
         return f"{bps:.0f} B/s"
 
+
 def get_system_stats():
     global prev_net, prev_time
+
     cpu = psutil.cpu_percent(interval=None)
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
@@ -107,6 +97,7 @@ def get_system_stats():
         "hostname": hostname
     }
 
+
 def get_top_processes(limit=10):
     procs = []
     for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
@@ -117,20 +108,28 @@ def get_top_processes(limit=10):
     procs = sorted(procs, key=lambda p: p['cpu_percent'], reverse=True)
     return procs[:limit]
 
+
 # ---------------- Layout ----------------
 def create_layout():
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=4),
         Layout(name="bars", size=6),
-        Layout(name="network", size=3),
         Layout(name="bottom")
     )
+
     layout["bottom"].split_row(
-        Layout(name="processes", ratio=60),
+        Layout(name="left", ratio=60),   # bottom-left: processes + network
         Layout(name="disk_preview", ratio=40)
     )
+
+    layout["left"].split_column(
+        Layout(name="processes", ratio=60),
+        Layout(name="network", ratio=40)  # network panel now in bottom-left
+    )
+
     return layout
+
 
 def build_bars(stats):
     cpu_color = get_color(stats["cpu"])
@@ -165,6 +164,7 @@ def build_bars(stats):
     bars_table.add_row(disk_bar)
     return bars_table
 
+
 def build_network_table(stats):
     net_table = Table.grid(expand=True)
     net_table.add_column("Upload", justify="right")
@@ -174,6 +174,7 @@ def build_network_table(stats):
         format_bytes_per_sec(stats["net_recv_rate"])
     )
     return Panel(net_table, title="Network Info", style="bold green")
+
 
 def build_process_table(top_procs):
     proc_table = Table(expand=True, show_header=True, header_style="bold cyan")
@@ -192,6 +193,7 @@ def build_process_table(top_procs):
             f"{p['memory_percent']:.1f}"
         )
     return proc_table
+
 
 def build_disk_preview():
     disks = psutil.disk_partitions(all=False)
@@ -215,13 +217,6 @@ def build_disk_preview():
 
     return Panel(table, title="Disk Preview", style="bold yellow")
 
-def build_speedtest_panel():
-    with speed_samples_lock:
-        graph_line = "".join("█" if x > 0 else " " for x in speed_samples[-50:])
-        text = speedtest_result_text if speedtest_result_text else "(running...)" if speedtest_running else "(not started)"
-        error = f"[red]{speedtest_error}[/red]" if speedtest_error else ""
-    panel_content = Text(graph_line + "\n" + text + "\n" + error)
-    return Panel(panel_content, title="Speedtest Panel", style="bold magenta", expand=True)
 
 def render_layout(layout, stats, top_procs):
     header_text = Text(
@@ -229,16 +224,19 @@ def render_layout(layout, stats, top_procs):
         style="bold green"
     )
     commands_text = Text(
-        "Commands: Ctrl+C = Exit | k = Kill | n = Speedtest | f = Freeze",
+        "Commands: Ctrl+C = Exit | k = Kill | n = Network | f = Freeze",
         style="bold cyan"
     )
     layout["header"].update(Panel(header_text + "\n" + commands_text, style="bold white"))
     layout["bars"].update(build_bars(stats))
-    layout["network"].update(build_network_table(stats))
     layout["processes"].update(build_process_table(top_procs))
     layout["disk_preview"].update(build_disk_preview())
-    if speedtest_toggle:
-        layout["network"].update(build_speedtest_panel())
+
+    if network_visible:
+        layout["network"].update(build_network_table(stats))
+    else:
+        layout["network"].update(Panel(Text("Network panel hidden", justify="center"), style="bold green"))
+
 
 # ---------------- Kill Process ----------------
 def kill_proc_tree(pid):
@@ -252,12 +250,15 @@ def kill_proc_tree(pid):
     except Exception as e:
         console.print(f"[red]Error killing process: {e}[/red]")
 
+
 def kill_process_prompt(top_procs, live):
     live.stop()
     console.clear()
+
     console.print("[bold yellow]Kill a process[/bold yellow]")
     for i, p in enumerate(top_procs, 1):
         console.print(f"[cyan]{i}[/cyan]: {p['name']} (PID {p['pid']}) CPU {p['cpu_percent']:.1f}%")
+
     try:
         console.print()
         choice = int(console.input("[bold white]Enter process number to kill (0 to cancel): [/bold white]"))
@@ -273,67 +274,6 @@ def kill_process_prompt(top_procs, live):
         time.sleep(1)
         live.start()
 
-# ---------------- Speedtest Integration ----------------
-def run_speedtest_background():
-    global speedtest_running, speedtest_result_text, speedtest_error, speed_samples
-    if speedtest_running:
-        return
-
-    def _worker():
-        global speedtest_running, speedtest_result_text, speedtest_error, speed_samples
-        speedtest_running = True
-        speedtest_result_text = ""
-        speedtest_error = None
-        with speed_samples_lock:
-            speed_samples = []
-
-        try:
-            proc = subprocess.Popen(
-                ["speedtest-cli", "--simple"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1
-            )
-        except FileNotFoundError:
-            speedtest_error = "speedtest-cli not found."
-            speedtest_running = False
-            return
-        except Exception as e:
-            speedtest_error = f"Failed to start speedtest-cli: {e}"
-            speedtest_running = False
-            return
-
-        last = psutil.net_io_counters()
-        last_time = time.time()
-
-        try:
-            for line in proc.stdout:
-                line = line.strip()
-                if line:
-                    with speed_samples_lock:
-                        speedtest_result_text += line + "\n"
-
-                now = time.time()
-                cur = psutil.net_io_counters()
-                dt = max(now - last_time, 1e-6)
-                down_bps = (cur.bytes_recv - last.bytes_recv) / dt
-                up_bps = (cur.bytes_sent - last.bytes_sent) / dt
-                sample_mbps = max(down_bps, up_bps) * 8.0 / 1_000_000.0
-                with speed_samples_lock:
-                    speed_samples.append(sample_mbps)
-                    if len(speed_samples) > 200:
-                        speed_samples = speed_samples[-200:]
-                last = cur
-                last_time = now
-        except Exception as e:
-            speedtest_error = f"Speedtest error: {e}"
-
-        proc.wait(timeout=10)
-        speedtest_running = False
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
 
 # ---------------- Main ----------------
 def main():
@@ -342,19 +282,15 @@ def main():
     prev_net = psutil.net_io_counters()
     prev_time = time.time()
 
-    # Start key listeners
-    threading.Thread(target=listen_for_kill, daemon=True).start()
-    threading.Thread(target=listen_for_freeze, daemon=True).start()
-    threading.Thread(target=listen_for_speedtest_toggle, daemon=True).start()
+    threading.Thread(target=listen_for_keys, daemon=True).start()
 
     layout = create_layout()
     with Live(layout, refresh_per_second=2, screen=True) as live:
         try:
             while True:
-                stats = get_system_stats()
-                top_procs = get_top_processes()
-
-                if not freeze_requested:
+                if not freeze:
+                    stats = get_system_stats()
+                    top_procs = get_top_processes()
                     render_layout(layout, stats, top_procs)
 
                 if kill_requested:
@@ -365,6 +301,7 @@ def main():
 
         except KeyboardInterrupt:
             console.print("\n[red]Exiting Sour CLI Sys Monitor...[/red]")
+
 
 if __name__ == "__main__":
     main()
