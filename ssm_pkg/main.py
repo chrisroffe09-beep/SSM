@@ -218,7 +218,7 @@ def run_speedtest(panel):
 
         panel.update(
             Panel(
-                Text(f"Final Outputs:\nUp.: {format_speed(upload_bps)}\nDown.: {format_speed(download_bps)}", justify="center"),
+                Text(f"Final Outputs:\nUpload: {format_speed(upload_bps)}\nDownload: {format_speed(download_bps)}", justify="center"),
                 title="Speedtest Complete",
                 style="bold green",
             )
