@@ -35,9 +35,9 @@ This will copy the launcher to /usr/local/bin, so you can run `ssm` from anywher
 ## Usage
 
 After installation, simply run:
-
-ssm
-
+```
+sudo ssm
+```
 Press Ctrl+C to exit.
 
 ---
@@ -52,8 +52,7 @@ Press Ctrl+C to exit.
 
 ## Notes
 
-- Requires Python 3 and the packages psutil and rich.
+- Requires Python 3 and the packages psutil, rich, keyboard, and speedtest-cli.
 - Tested on Ubuntu/Linux environments.
-- Works on systems without temperature sensors.
 
 ---
